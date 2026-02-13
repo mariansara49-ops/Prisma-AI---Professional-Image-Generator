@@ -9,7 +9,6 @@ const ensureApiKey = async (isPro: boolean): Promise<string | undefined> => {
       if (!hasKey) {
         if (window.aistudio.openSelectKey) {
           await window.aistudio.openSelectKey();
-          // Assume success after dialog close/interaction, strict check might need retry
         }
       }
     }
@@ -20,7 +19,7 @@ const ensureApiKey = async (isPro: boolean): Promise<string | undefined> => {
 export const generateImage = async (config: GenerationConfig): Promise<GeneratedImage> => {
   await ensureApiKey(config.isPro);
   
-  // Re-initialize to pick up potential new key from local storage/env if updated by window.aistudio
+  // Re-initialize right before use to pick up the latest key from the dialog
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
   const modelName = config.isPro ? 'gemini-3-pro-image-preview' : 'gemini-2.5-flash-image';
@@ -40,29 +39,41 @@ export const generateImage = async (config: GenerationConfig): Promise<Generated
         parts: [{ text: config.prompt }],
       },
       config: {
+        // Removed systemInstruction as it is not strictly supported/required for these specific image models
         imageConfig: imageConfig,
       },
     });
 
     let imageUrl = '';
+    let textResponse = '';
 
-    // Iterate through parts to find the image
-    if (response.candidates && response.candidates[0] && response.candidates[0].content && response.candidates[0].content.parts) {
-      for (const part of response.candidates[0].content.parts) {
+    if (!response.candidates || response.candidates.length === 0) {
+        throw new Error("No candidates returned. The prompt might have been blocked or the model is busy.");
+    }
+
+    const candidate = response.candidates[0];
+
+    if (candidate.content && candidate.content.parts) {
+      for (const part of candidate.content.parts) {
         if (part.inlineData) {
           const base64EncodeString = part.inlineData.data;
-          // Gemini returns raw data, we need to construct the data URI. 
-          // Default mimeType is usually image/jpeg or image/png depending on model, 
-          // but the part.inlineData.mimeType should be present.
           const mimeType = part.inlineData.mimeType || 'image/png';
           imageUrl = `data:${mimeType};base64,${base64EncodeString}`;
-          break; // Found the image
+          break; 
+        } else if (part.text) {
+          textResponse += part.text;
         }
       }
     }
 
     if (!imageUrl) {
-        throw new Error("No image data found in response");
+        if (candidate.finishReason === 'SAFETY') {
+            throw new Error("Content blocked by safety filters. Please try a different prompt.");
+        }
+        if (textResponse) {
+            throw new Error(textResponse);
+        }
+        throw new Error(`Generation failed. Reason: ${candidate.finishReason || 'Unknown'}`);
     }
 
     return {
@@ -76,19 +87,20 @@ export const generateImage = async (config: GenerationConfig): Promise<Generated
 
   } catch (error: any) {
     console.error("Gemini Generation Error:", error);
-    // Handling specific error cases if needed
-    if (error.message?.includes("Requested entity was not found") && config.isPro) {
-       // Reset key logic could go here, but for now just throw
-       throw new Error("API Key issue or Model not found. Please try selecting a key again.");
+    
+    // Convert error to string for robust matching, handling both object and string errors
+    const errorStr = typeof error === 'object' ? JSON.stringify(error) : String(error);
+    
+    // Explicitly check for 403 or PERMISSION_DENIED which indicates project/key issues
+    if (errorStr.includes("PERMISSION_DENIED") || errorStr.includes("403") || errorStr.includes("not found")) {
+       throw new Error("PRO_KEY_ERROR: The selected API key does not have permission for Gemini 3 Pro. Ensure your GCP project has billing enabled and the Generative Language API is active.");
     }
+    
     throw error;
   }
 };
 
-// Global type augmentation for window.aistudio
 declare global {
-  // We augment the interface that window.aistudio is already declared as.
-  // This avoids "Subsequent property declarations must have the same type" error.
   interface AIStudio {
     hasSelectedApiKey: () => Promise<boolean>;
     openSelectKey: () => Promise<void>;
